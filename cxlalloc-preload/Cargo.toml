@@ -1,0 +1,19 @@
+[package]
+name = "cxlalloc-preload"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["backend-dax"]
+backend-dax = ["cxlalloc/backend-dax"]
+log = ["dep:env_logger"]
+
+[dependencies]
+cxlalloc = { path = "../cxlalloc", default-features = false, features = ["arch-gpf"] }
+env_logger = { workspace = true, optional = true }
+libc.workspace = true
+log.workspace = true
+shm = { git = "https://github.com/nwtnni/shm.git", features = ["dax"] }

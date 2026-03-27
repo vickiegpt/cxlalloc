@@ -1,0 +1,26 @@
+[package]
+name = "cxlalloc-recover"
+version = "0.1.0"
+edition = "2021"
+default-run = "cxlalloc-recover"
+
+[features]
+cxlalloc = ["memento/cxlalloc"]
+
+[[bin]]
+name = "cxlalloc-recover-worker"
+path = "src/bin/worker.rs"
+
+[dependencies]
+bon.workspace = true
+cartesian.workspace = true
+clap.workspace = true
+core_affinity.workspace = true
+duct.workspace = true
+crossbeam-channel = { path = "../extern/memento/crossbeam-persistency/crossbeam-channel" }
+crossbeam-epoch = { path = "../extern/memento/crossbeam-persistency/crossbeam-epoch" }
+crossbeam-utils = { path = "../extern/memento/crossbeam-persistency/crossbeam-utils" }
+memento = { path = "../extern/memento", features = ["no_persist", "use_clwb"] }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true

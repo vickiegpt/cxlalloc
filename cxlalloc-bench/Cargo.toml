@@ -1,0 +1,86 @@
+[package]
+name = "cxlalloc-bench"
+version = "0.1.0"
+edition = "2021"
+default-run = "cxlalloc-bench"
+
+[[bin]]
+name = "cxlalloc-bench-worker"
+path = "src/bin/worker.rs"
+
+[[bin]]
+name = "cxlalloc-bench-coordinator"
+path = "src/bin/coordinator.rs"
+
+[features]
+default = [
+    "allocator-cxlalloc",
+    "allocator-mimalloc",
+    "allocator-cxl-shm",
+    "allocator-boost",
+    "allocator-lightning",
+    "allocator-ralloc",
+    "recover-shm",
+]
+consistency-sfence = [
+    "cxlalloc-global/recover",
+    "cxlalloc-global/arch-gpf",
+    "cxlalloc-global/arch-clflushopt",
+    "cxlalloc-global/arch-clwb",
+]
+consistency-clflush = ["cxlalloc-global/recover"]
+consistency-clflushopt = [
+    "cxlalloc-global/recover",
+    "cxlalloc-global/arch-clflushopt",
+    "cxlalloc-global/arch-clwb",
+]
+stat-event = ["cxlalloc-global/stat-event"]
+cxl-limited = [
+    "cxlalloc-global/cxl-limited",
+    "cxlalloc-global/arch-clwb",
+    "cxlalloc-global/arch-clflushopt",
+]
+cxl-mcas = [
+    "cxlalloc-global/cxl-mcas",
+    "cxlalloc-global/arch-clwb",
+    "cxlalloc-global/arch-clflushopt",
+]
+dax-mmap = ["cxlalloc-global/backend-dax"]
+recover-shm = ["cxlalloc-global/recover-shm"]
+validate = ["cxlalloc-global/validate"]
+opt-memcpy = ["cxlalloc-global/opt-memcpy"]
+
+uiuc = ["allocator-cxlalloc", "recover-shm", "cxl-mcas"]
+
+allocator-cxlalloc = ["dep:cxlalloc-global"]
+allocator-mimalloc = []
+allocator-cxl-shm = []
+allocator-boost = []
+allocator-lightning = []
+allocator-ralloc = []
+
+[dependencies]
+shm-bench.workspace = true
+anyhow.workspace = true
+bon.workspace = true
+cartesian.workspace = true
+clap.workspace = true
+cxlalloc-global = { path = "../cxlalloc-global", features = [
+    "backend-shm",
+], optional = true }
+cxx.workspace = true
+duct.workspace = true
+env_logger.workspace = true
+libc.workspace = true
+log.workspace = true
+serde.workspace = true
+serde-inline-default.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+shm.workspace = true
+ycsb.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+cmake.workspace = true
+cxx-build.workspace = true

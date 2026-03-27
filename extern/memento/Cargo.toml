@@ -1,0 +1,46 @@
+[package]
+name = "memento"
+version = "0.1.0"
+authors = ["Anonymous"]
+edition = "2021"
+build = "build.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["use_clwb"]
+tcrash = []
+no_persist = []
+use_clflushopt = []
+use_clwb = []
+use_msync = []
+stat_print_flushes = []
+stress = []
+cxlalloc = []
+
+[dependencies]
+mmt_derive = { path = "./src/derive" }
+crossbeam-epoch = { path = "./crossbeam-persistency/crossbeam-epoch" }
+crossbeam-utils = { path = "./crossbeam-persistency/crossbeam-utils" }
+# crossbeam-channel = "0.5.6"
+
+crossbeam-channel = { path = "./crossbeam-persistency/crossbeam-channel" }
+cxlalloc-global = { path = "../../cxlalloc-global", features = [
+    "backend-shm",
+    "validate",
+] }
+
+atomic = "0.5"
+core_affinity = "0.8"
+etrace = "1.1.1"
+tempfile = "3.3.0"
+array-init = "2.1.0"
+lazy_static = "1.4.0"
+itertools = "0.10.5"
+rapidhash = "1.4"
+cfg-if = "1.0.0"
+tinyvec = { version = "1.6.0", features = ["alloc", "rustc_1_40"] }
+libc = "0.2.138"
+
+[dev-dependencies]
+log = "0.4.17"
+rusty-fork = "0.3.0"

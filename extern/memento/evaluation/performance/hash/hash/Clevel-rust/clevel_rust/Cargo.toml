@@ -1,0 +1,34 @@
+[package]
+name = "clevel"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+memento  = { path = "../../../../../../" }
+crossbeam-epoch = { path = "../../../../../../crossbeam-persistency/crossbeam-epoch" }
+crossbeam-utils = { path = "../../../../../../crossbeam-persistency/crossbeam-utils" }
+crossbeam-channel = { path = "../../../../../../crossbeam-persistency/crossbeam-channel" }
+
+itertools = "0.10.3"
+etrace = "1.1.1"
+hashers = "1.0.1"
+scopeguard = "1.1.0"
+cfg-if = "1.0.0"
+parking_lot = "0.12.1"
+derivative = "2.2.0"
+tinyvec = { version = "1.5.1", features = ["alloc", "rustc_1_40"] }
+array-init = "2.0.0"
+
+[lib]
+name = "clevel_rust"
+crate_type = ["staticlib"]
+
+[features]
+# default = ["stress"]
+default = []
+stress = []
+no_persist = ["memento/no_persist"]
+pmdk = ["memento/pmdk"]

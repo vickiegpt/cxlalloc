@@ -1,0 +1,17 @@
+[package]
+name = "shm"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+serde = ["dep:serde"]
+dax = []
+ivshmem = ["dep:ribbit"]
+
+[dependencies]
+bon = "3.6"
+libc = "0.2"
+log = "0.4"
+ribbit = { git = "https://github.com/nwtnni/ribbit.git", optional = true, rev = "7a9d17345a3ff8c500f7f3a55b89fe0be068ae61" }
+serde = { version = "1.0", features = ["derive"], optional = true }

@@ -1,0 +1,34 @@
+[package]
+name = "cxlalloc-global"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+arch-gpf = ["cxlalloc/arch-gpf"]
+arch-clwb = ["cxlalloc/arch-clwb"]
+arch-clflushopt = ["cxlalloc/arch-clflushopt"]
+
+backend = ["backend-dax", "backend-ivshmem", "backend-shm"]
+backend-dax = ["cxlalloc/backend-dax"]
+backend-shm = ["cxlalloc/backend-shm"]
+backend-ivshmem = ["cxlalloc/backend-ivshmem"]
+
+recover = ["cxlalloc/recover"]
+recover-shm = ["cxlalloc/recover-shm"]
+recover-cas = ["cxlalloc/recover-cas"]
+recover-flush = ["cxlalloc/recover-flush"]
+recover-log = ["cxlalloc/recover-log"]
+
+cxl-limited = ["cxlalloc/cxl-limited"]
+cxl-mcas = ["cxlalloc/cxl-mcas"]
+
+stat-event = ["cxlalloc/stat-event"]
+stat-memory = ["cxlalloc/stat-memory"]
+
+opt-memcpy = ["cxlalloc/opt-memcpy"]
+
+validate = ["cxlalloc/validate"]
+
+[dependencies]
+cxlalloc = { path = "../cxlalloc", default-features = false }
+libc.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "cxlalloc-test"
+version = "0.1.0"
+edition = "2024"
+default-run = "cxlalloc-test"
+
+[[bin]]
+name = "cxlalloc-test-worker"
+path = "src/worker.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cxlalloc = { path = "../cxlalloc", features = ["backend-shm", "validate"] }
+env_logger.workspace = true
+ipc-channel.workspace = true
+libc.workspace = true
+log.workspace = true
+serde.workspace = true
+toml.workspace = true

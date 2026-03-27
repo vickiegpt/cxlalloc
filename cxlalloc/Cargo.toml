@@ -1,0 +1,53 @@
+[package]
+name = "cxlalloc"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["arch-gpf", "recover"]
+
+arch-gpf = []
+arch-clwb = []
+arch-clflushopt = []
+
+backend-dax = ["shm/dax"]
+backend-ivshmem = []
+backend-shm = []
+backend = ["backend-dax", "backend-ivshmem", "backend-shm"]
+
+recover = ["recover-cas", "recover-flush", "recover-log"]
+recover-shm = ["recover-cas", "recover-log"]
+recover-flush = []
+# Enable detectable CAS
+recover-cas = []
+# Enable state transition logging
+recover-log = []
+
+cxl-limited = []
+cxl-mcas = []
+
+stat-event = ["dep:serde"]
+stat-memory = []
+stat-size = ["dep:hdrhistogram"]
+
+opt-memcpy = []
+
+validate = []
+
+[dependencies]
+bon.workspace = true
+hdrhistogram = { workspace = true, optional = true }
+gcollections.workspace = true
+intervallum.workspace = true
+libc.workspace = true
+log.workspace = true
+ribbit.workspace = true
+serde = { workspace = true, optional = true }
+shm.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+crash = { path = "../crash" }
+env_logger.workspace = true
+proptest.workspace = true
+proptest-state-machine.workspace = true

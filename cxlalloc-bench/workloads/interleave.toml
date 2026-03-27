@@ -1,0 +1,53 @@
+repeat = 1
+
+# CXL DAX 0.0 + main memory interleaving benchmark.
+#
+# Build with:
+#   cargo build --release -p cxlalloc-bench --features "dax-mmap,recover-shm"
+#
+# Run with:
+#   CXLALLOC_DAX_DEVICES="/dev/dax0.0" \
+#     cargo run --release -p cxlalloc-bench --features "dax-mmap,recover-shm" \
+#     -- --config workloads/interleave.toml
+#
+# The dax-mmap feature enables the DaxMmap backend which round-robin
+# interleaves region allocations between the CXL DAX device and
+# anonymous mmap (local DRAM).
+
+[[experiment]]
+output = "interleave.ndjson"
+numa = [{ policy = "bind", node = 0 }]
+thread_count = [1, 2, 4, 8, 16]
+process_count = [1]
+allocator = [{ name = "cxlalloc" }]
+
+[experiment.allocator_config]
+size = [4294967296]
+
+[[experiment.benchmark]]
+kind = "thread_test"
+iteration_count = [10000]
+operation_count = [10000]
+object_size = [8]
+
+[[experiment.benchmark]]
+kind = "xmalloc"
+operation_count = [100000]
+
+[[experiment.benchmark]]
+kind = "key_value"
+
+[[experiment.benchmark.workload]]
+name = "ycsb"
+record_count = [100000]
+operation_count = [100000]
+
+[[experiment.benchmark.workload.mix]]
+phase = "load"
+
+[[experiment.benchmark.workload.mix]]
+phase = "run"
+read = 0.50
+insert = 0.25
+delete = 0.25
+distribution = "zipfian"
