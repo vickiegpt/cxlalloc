@@ -255,9 +255,8 @@ impl DaxArena {
 
     fn pointer_offset(&self, pointer: *const c_void) -> Option<usize> {
         let start = self.base.as_ptr() as usize;
-        let end = start.checked_add(self.size)?;
-        let pointer = pointer as usize;
-        (start..end).contains(&pointer).then_some(pointer - start)
+        let offset = (pointer as usize).checked_sub(start)?;
+        (offset < self.size).then_some(offset)
     }
 
     #[cfg(test)]
@@ -452,6 +451,13 @@ mod tests {
         let arena = DaxArena::anonymous_for_test(4 << 20, 2 << 20).unwrap();
         assert!(arena.allocate(4 << 20, 4096).is_ok());
         assert_eq!(arena.allocate(1, 1), Err(ArenaError::OutOfMemory));
+    }
+
+    #[test]
+    fn pointer_below_arena_is_not_owned() {
+        let arena = DaxArena::anonymous_for_test(4 << 20, 2 << 20).unwrap();
+        let below = arena.base.as_ptr().wrapping_sub(1).cast();
+        assert!(!arena.owns(below));
     }
 
     #[test]
