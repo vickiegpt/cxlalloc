@@ -29,6 +29,8 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod real;
+
 use core::ffi;
 use core::mem;
 use core::ptr;
@@ -51,6 +53,29 @@ static RAW: OnceLock<raw::Raw> = OnceLock::new();
 /// Set to true once the allocator is fully initialized.
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+struct PlacementPolicy {
+    min_size: usize,
+}
+
+impl PlacementPolicy {
+    const DEFAULT_MIN_SIZE: usize = 2 << 20;
+
+    fn new(min_size: usize) -> Self {
+        Self { min_size }
+    }
+
+    fn from_env() -> Self {
+        let min_size = std::env::var("CXLALLOC_MIN_SIZE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(Self::DEFAULT_MIN_SIZE);
+        Self::new(min_size)
+    }
+
+    fn uses_cxl(&self, size: usize) -> bool {
+        size >= self.min_size
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Early bump allocator
@@ -76,7 +101,11 @@ fn early_buf_base() -> *mut u8 {
 
 fn early_malloc(size: usize) -> *mut ffi::c_void {
     let align = 16;
-    let size = if size == 0 { align } else { (size + align - 1) & !(align - 1) };
+    let size = if size == 0 {
+        align
+    } else {
+        (size + align - 1) & !(align - 1)
+    };
     let offset = EARLY_OFFSET.fetch_add(size, Ordering::Relaxed);
     if offset + size > EARLY_SIZE {
         unsafe {
@@ -200,8 +229,7 @@ unsafe extern "C" fn init() {
     // Register the constructor thread as slot 0
     TID_SLOTS[0].store(current_tid(), Ordering::Relaxed);
 
-    let backend_name = std::env::var("CXLALLOC_BACKEND")
-        .unwrap_or_else(|_| "dax-mmap".to_owned());
+    let backend_name = std::env::var("CXLALLOC_BACKEND").unwrap_or_else(|_| "dax-mmap".to_owned());
 
     let heap_size: usize = std::env::var("CXLALLOC_HEAP_SIZE")
         .ok()
@@ -495,5 +523,22 @@ pub unsafe extern "C" fn memmove(
             options(nostack),
         );
         dest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlacementPolicy;
+
+    #[test]
+    fn default_policy_keeps_small_allocations_in_dram() {
+        let policy = PlacementPolicy::new(2 << 20);
+        assert!(!policy.uses_cxl(4096));
+    }
+
+    #[test]
+    fn default_policy_routes_128_mib_to_cxl() {
+        let policy = PlacementPolicy::new(2 << 20);
+        assert!(policy.uses_cxl(128 << 20));
     }
 }
