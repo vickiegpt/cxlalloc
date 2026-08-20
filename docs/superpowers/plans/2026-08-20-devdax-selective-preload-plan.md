@@ -20,6 +20,8 @@
 - Use scalar MMIO-safe initialization and copies for CXL-owned memory.
 - Preserve the existing unrelated `cxlalloc-bench/build.rs` modification and untracked `target/` artifacts.
 - Each production change follows a witnessed failing test, minimal implementation, and passing regression test.
+- The `.init_array` constructor registration is disabled under `cfg(test)`;
+  unit tests initialize their own controlled state explicitly.
 
 ---
 
@@ -45,6 +47,14 @@
 - Produces: `PlacementPolicy::from_env() -> PlacementPolicy`
 - Produces: `PlacementPolicy::uses_cxl(size: usize) -> bool`
 - Consumes: the existing early bump allocator during recursive symbol resolution.
+
+- [ ] **Step 0: Make the existing unit-test harness runnable**
+
+Add `#[cfg(not(test))]` to the `INIT` static's `.init_array` registration while
+leaving `init()` callable. Run `cargo test -p cxlalloc-preload -- --nocapture`.
+Expected: the pre-existing constructor abort disappears and the package reports
+a successful zero-test baseline. Production debug and release cdylib builds
+still contain `.init_array`.
 
 - [ ] **Step 1: Add failing policy tests**
 

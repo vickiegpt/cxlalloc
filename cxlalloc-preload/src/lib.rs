@@ -188,6 +188,7 @@ extern "C" fn handle_sigsegv(
 // Constructor — runs when the .so is loaded (before main)
 // ---------------------------------------------------------------------------
 
+#[cfg(not(test))]
 #[used]
 #[link_section = ".init_array"]
 static INIT: unsafe extern "C" fn() = init;
