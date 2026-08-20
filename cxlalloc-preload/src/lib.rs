@@ -1,31 +1,9 @@
-//! LD_PRELOAD shared library for transparent CXL DAX + main memory interleaving.
+//! `LD_PRELOAD` allocator that places selected large allocations on CXL devdax.
 //!
-//! Intercepts standard `malloc`/`free`/`realloc`/`calloc`/`memalign` calls and
-//! routes them through cxlalloc with the configured backend.
-//!
-//! # Environment variables
-//!
-//! | Variable | Default | Description |
-//! |----------|---------|-------------|
-//! | `CXLALLOC_BACKEND` | `dax-mmap` | Backend: `mmap`, `shm`, `dax`, `dax-mmap` |
-//! | `CXLALLOC_DAX_DEVICES` | `/dev/dax0.0` | Comma-separated DAX device paths |
-//! | `CXLALLOC_HEAP_SIZE` | `4294967296` (4 GiB) | Total heap size in bytes |
-//! | `CXLALLOC_MAX_THREADS` | `64` | Maximum number of concurrent threads |
-//! | `CXLALLOC_NUMA` | (none) | NUMA node to bind heap memory to |
-//!
-//! # Usage
-//!
-//! ```bash
-//! cargo build --release -p cxlalloc-preload
-//!
-//! # Test with mmap backend (no CXL hardware needed):
-//! CXLALLOC_BACKEND=mmap \
-//!   LD_PRELOAD=target/release/libcxlalloc_preload.so ./my_application
-//!
-//! # CXL DAX + DRAM interleaving:
-//! CXLALLOC_BACKEND=dax-mmap CXLALLOC_DAX_DEVICES=/dev/dax0.0 \
-//!   LD_PRELOAD=target/release/libcxlalloc_preload.so ./my_application
-//! ```
+//! `dax-mmap` is allocation-selective: allocations at least
+//! `CXLALLOC_MIN_SIZE` bytes use `/dev/dax0.0`, while smaller allocations use
+//! the real libc allocator in DRAM. A selected allocation never spills into
+//! DRAM.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -33,25 +11,28 @@ mod dax_arena;
 mod real;
 
 use core::ffi;
-use core::mem;
 use core::ptr;
 use core::ptr::NonNull;
-use std::alloc::Layout;
+use std::ffi::CString;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
 
-use cxlalloc::raw;
+use dax_arena::ArenaError;
+use dax_arena::DaxArena;
+use real::RealAlloc;
 
-// ---------------------------------------------------------------------------
-// Global state
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+unsafe extern "C" {
+    fn __libc_malloc(size: usize) -> *mut ffi::c_void;
+    fn __libc_calloc(count: usize, size: usize) -> *mut ffi::c_void;
+    fn __libc_realloc(pointer: *mut ffi::c_void, size: usize) -> *mut ffi::c_void;
+    fn __libc_free(pointer: *mut ffi::c_void);
+    fn __libc_memalign(alignment: usize, size: usize) -> *mut ffi::c_void;
+}
 
-static RAW: OnceLock<raw::Raw> = OnceLock::new();
-
-/// Set to true once the allocator is fully initialized.
+static STATE: OnceLock<State> = OnceLock::new();
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 struct PlacementPolicy {
@@ -78,18 +59,85 @@ impl PlacementPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendMode {
+    Dax,
+    DaxMmap,
+    Mmap,
+}
+
+impl BackendMode {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value.unwrap_or("dax-mmap") {
+            "dax" => Ok(Self::Dax),
+            "dax-mmap" => Ok(Self::DaxMmap),
+            "mmap" => Ok(Self::Mmap),
+            _ => Err("cxlalloc-preload: unsupported CXLALLOC_BACKEND\n"),
+        }
+    }
+}
+
+struct State {
+    real: &'static RealAlloc,
+    policy: PlacementPolicy,
+    arena: Option<DaxArena>,
+}
+
+impl State {
+    fn from_env() -> Result<Self, &'static str> {
+        let real = RealAlloc::resolve()?;
+        let backend_value = std::env::var("CXLALLOC_BACKEND").ok();
+        let backend = BackendMode::parse(backend_value.as_deref())?;
+        let policy = PlacementPolicy::from_env();
+        let arena = match backend {
+            BackendMode::Dax | BackendMode::DaxMmap => {
+                let devices = std::env::var("CXLALLOC_DAX_DEVICES")
+                    .unwrap_or_else(|_| "/dev/dax0.0".to_owned());
+                let first = devices.split(',').next().unwrap_or("").trim();
+                CString::new(first)
+                    .ok()
+                    .and_then(|path| DaxArena::open(path.as_c_str()).ok())
+            }
+            BackendMode::Mmap => {
+                let size = std::env::var("CXLALLOC_HEAP_SIZE")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(256 << 20);
+                DaxArena::anonymous(size, PlacementPolicy::DEFAULT_MIN_SIZE).ok()
+            }
+        };
+
+        Ok(Self {
+            real,
+            policy,
+            arena,
+        })
+    }
+
+    #[cfg(test)]
+    fn anonymous_for_test(size: usize, min_size: usize) -> Result<Self, ArenaError> {
+        let real = RealAlloc::resolve().map_err(|_| ArenaError::InvalidDevice)?;
+        Ok(Self {
+            real,
+            policy: PlacementPolicy::new(min_size),
+            arena: Some(DaxArena::anonymous(size, min_size)?),
+        })
+    }
+
+    fn arena_owns(&self, pointer: *const ffi::c_void) -> bool {
+        self.arena.as_ref().is_some_and(|arena| arena.owns(pointer))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Early bump allocator
-//
-// Before the cxlalloc constructor runs (and for any re-entrant malloc calls
-// during initialization), we service allocations from a static buffer.
-// This avoids all TLS and Rust runtime dependencies.
 // ---------------------------------------------------------------------------
 
-const EARLY_SIZE: usize = 8 << 20; // 8 MiB
+#[cfg(not(test))]
+const EARLY_SIZE: usize = 8 << 20;
+#[cfg(test)]
+const EARLY_SIZE: usize = 64 << 20;
 
-/// Early bump buffer, 16-byte aligned so that allocations returned from
-/// `early_malloc` satisfy the alignment requirements of all standard types.
 #[repr(C, align(16))]
 struct EarlyBuf(core::cell::UnsafeCell<[u8; EARLY_SIZE]>);
 unsafe impl Sync for EarlyBuf {}
@@ -101,121 +149,30 @@ fn early_buf_base() -> *mut u8 {
 }
 
 fn early_malloc(size: usize) -> *mut ffi::c_void {
-    let align = 16;
-    let size = if size == 0 {
-        align
-    } else {
-        (size + align - 1) & !(align - 1)
+    let alignment = 16;
+    let Some(size) = size
+        .max(alignment)
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+    else {
+        return ptr::null_mut();
     };
-    let offset = EARLY_OFFSET.fetch_add(size, Ordering::Relaxed);
-    if offset + size > EARLY_SIZE {
-        unsafe {
-            let p = libc::mmap(
-                ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                -1,
-                0,
-            );
-            if p == libc::MAP_FAILED {
-                ptr::null_mut()
-            } else {
-                p
-            }
-        }
-    } else {
-        unsafe { early_buf_base().add(offset).cast() }
-    }
+    let Ok(offset) = EARLY_OFFSET.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |offset| {
+        offset.checked_add(size).filter(|end| *end <= EARLY_SIZE)
+    }) else {
+        return ptr::null_mut();
+    };
+    unsafe { early_buf_base().add(offset).cast() }
 }
 
-fn is_early_pointer(p: *mut ffi::c_void) -> bool {
+fn is_early_pointer(pointer: *mut ffi::c_void) -> bool {
     let base = early_buf_base() as usize;
-    let addr = p as usize;
-    addr >= base && addr < base + EARLY_SIZE
+    let address = pointer as usize;
+    (base..base + EARLY_SIZE).contains(&address)
 }
 
 // ---------------------------------------------------------------------------
-// Thread ID management — no TLS, uses gettid() syscall + global registry
-//
-// This avoids the classic LD_PRELOAD re-entrancy problem where Rust's
-// thread_local! macro calls malloc during TLS initialization.
-// ---------------------------------------------------------------------------
-
-const MAX_SLOTS: usize = 512;
-
-/// Each slot stores a Linux TID (0 = empty).
-static TID_SLOTS: [AtomicU64; MAX_SLOTS] = {
-    const ZERO: AtomicU64 = AtomicU64::new(0);
-    [ZERO; MAX_SLOTS]
-};
-static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
-
-/// Per-slot re-entrancy guard. When true, the thread in this slot is already
-/// inside cxlalloc (e.g., `raw.allocator()` uses Vec internally which calls malloc).
-/// Re-entrant calls fall back to early_malloc.
-static IN_CXLALLOC: [AtomicBool; MAX_SLOTS] = {
-    const FALSE: AtomicBool = AtomicBool::new(false);
-    [FALSE; MAX_SLOTS]
-};
-
-#[inline]
-fn current_tid() -> u64 {
-    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
-}
-
-/// Map the current Linux TID to a cxlalloc slot (0..MAX_SLOTS-1).
-/// Uses compare-and-swap registration — lock-free and malloc-free.
-#[inline]
-fn get_slot() -> usize {
-    let tid = current_tid();
-
-    // Fast path: scan existing registrations
-    let limit = NEXT_SLOT.load(Ordering::Relaxed).min(MAX_SLOTS);
-    for i in 0..limit {
-        if TID_SLOTS[i].load(Ordering::Relaxed) == tid {
-            return i;
-        }
-    }
-
-    // Slow path: register a new slot
-    let slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
-    if slot >= MAX_SLOTS {
-        // Saturate — share slot 0 as last resort
-        NEXT_SLOT.store(MAX_SLOTS, Ordering::Relaxed);
-        return 0;
-    }
-    TID_SLOTS[slot].store(tid, Ordering::Relaxed);
-    slot
-}
-
-// ---------------------------------------------------------------------------
-// SIGSEGV handler for lazy page mapping
-// ---------------------------------------------------------------------------
-
-extern "C" fn handle_sigsegv(
-    _sig: libc::c_int,
-    info: *const libc::siginfo_t,
-    _ctx: *const libc::c_void,
-) {
-    let address = unsafe { (*info).si_addr() };
-    if let Some(raw) = RAW.get() {
-        let id = unsafe { cxlalloc::thread::Id::new(get_slot() as u16) };
-        if raw.map(id, address) {
-            return;
-        }
-    }
-
-    // Not our fault — restore default handler
-    unsafe {
-        let mut action = mem::zeroed::<libc::sigaction>();
-        action.sa_sigaction = libc::SIG_DFL;
-        libc::sigaction(libc::SIGSEGV, &action, ptr::null_mut());
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Constructor — runs when the .so is loaded (before main)
+// Constructor
 // ---------------------------------------------------------------------------
 
 #[cfg(not(test))]
@@ -224,312 +181,399 @@ extern "C" fn handle_sigsegv(
 static INIT: unsafe extern "C" fn() = init;
 
 unsafe extern "C" fn init() {
-    #[cfg(feature = "log")]
-    let _ = env_logger::try_init();
-
-    // Register the constructor thread as slot 0
-    TID_SLOTS[0].store(current_tid(), Ordering::Relaxed);
-
-    let backend_name = std::env::var("CXLALLOC_BACKEND").unwrap_or_else(|_| "dax-mmap".to_owned());
-
-    let heap_size: usize = std::env::var("CXLALLOC_HEAP_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(256 << 20); // 256 MiB default (set larger via env var)
-
-    let max_threads: usize = std::env::var("CXLALLOC_MAX_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-
-    let numa_node: Option<shm::Numa> = std::env::var("CXLALLOC_NUMA")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|node| shm::Numa::Bind { node });
-
-    let backend = {
-        // Use Physical populate for DAX backends so pages are pre-faulted and
-        // can be zeroed before the allocator touches them.
-        let populate_dax = Some(shm::Populate::Physical);
-        let builder = raw::Backend::builder().maybe_numa(numa_node);
-        match backend_name.as_str() {
-            "mmap" => builder.backend(raw::backend::Mmap).build(),
-            "shm" => builder.backend(raw::backend::Shm).build(),
-            #[cfg(feature = "backend-dax")]
-            "dax" => {
-                let devices = dax_devices();
-                let paths: Vec<&str> = devices.iter().map(String::as_str).collect();
-                builder
-                    .backend(shm::backend::Dax::new(&paths).expect("Failed to open DAX devices"))
-                    .maybe_populate(populate_dax)
-                    .build()
-            }
-            #[cfg(feature = "backend-dax")]
-            "dax-mmap" => {
-                let devices = dax_devices();
-                let paths: Vec<&str> = devices.iter().map(String::as_str).collect();
-                builder
-                    .backend(
-                        shm::backend::DaxMmap::new(&paths)
-                            .expect("Failed to open DAX devices for dax-mmap interleaving"),
-                    )
-                    .maybe_populate(populate_dax)
-                    .build()
-            }
-            other => {
-                eprintln!(
-                    "cxlalloc-preload: unknown CXLALLOC_BACKEND={other:?}, falling back to mmap"
-                );
-                builder.backend(raw::backend::Mmap).build()
-            }
+    match State::from_env() {
+        Ok(state) => {
+            let _ = STATE.set(state);
+            INITIALIZED.store(true, Ordering::Release);
         }
-    };
-
-    RAW.get_or_init(|| {
-        let raw = raw::Raw::builder()
-            .backend(backend)
-            .size_small(heap_size / 2)
-            .size_large(heap_size / 2)
-            .thread_count(max_threads)
-            .build("cxlalloc-preload")
-            .expect("cxlalloc-preload: failed to initialize allocator");
-
-        // DAX persistent memory may contain stale data from previous runs.
-        // Zero the metadata regions so the allocator starts with clean state.
-        if backend_name != "mmap" && backend_name != "shm" {
-            raw.zero_metadata();
-        }
-
-        raw
-    });
-
-    // Mark initialized — subsequent malloc calls go through cxlalloc
-    INITIALIZED.store(true, Ordering::Release);
-
-    // Install SIGSEGV handler for lazy page mapping.
-    let mut action = mem::zeroed::<libc::sigaction>();
-    action.sa_sigaction = handle_sigsegv as _;
-    action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
-    libc::sigaction(libc::SIGSEGV, &action, ptr::null_mut());
+        Err(message) => write_diagnostic(message.as_bytes()),
+    }
 }
 
-#[cfg(feature = "backend-dax")]
-fn dax_devices() -> Vec<String> {
-    std::env::var("CXLALLOC_DAX_DEVICES")
-        .unwrap_or_else(|_| "/dev/dax0.0".to_owned())
-        .split(',')
-        .map(|s| s.trim().to_owned())
-        .collect()
+fn write_diagnostic(message: &[u8]) {
+    unsafe {
+        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
+    }
+}
+
+fn state() -> Option<&'static State> {
+    INITIALIZED
+        .load(Ordering::Acquire)
+        .then(|| STATE.get())
+        .flatten()
+}
+
+fn set_errno(value: libc::c_int) {
+    unsafe { *libc::__errno_location() = value };
+}
+
+fn errno() -> libc::c_int {
+    unsafe { *libc::__errno_location() }
+}
+
+fn page_size() -> usize {
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .ok()
+        .filter(|size| *size != 0)
+        .unwrap_or(4096)
 }
 
 // ---------------------------------------------------------------------------
-// Standard allocator symbols — intercepted by LD_PRELOAD
-//
-// These use gettid + global registry instead of TLS, so they are safe to
-// call at any point during process initialization.
+// Routed allocation implementation
+// ---------------------------------------------------------------------------
+
+unsafe fn routed_malloc(size: usize, state: &State) -> *mut ffi::c_void {
+    if !state.policy.uses_cxl(size) {
+        return (state.real.malloc)(size);
+    }
+    let Some(arena) = state.arena.as_ref() else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    match arena.allocate(size, 16) {
+        Ok(pointer) => pointer.as_ptr(),
+        Err(_) => {
+            set_errno(libc::ENOMEM);
+            ptr::null_mut()
+        }
+    }
+}
+
+unsafe fn routed_aligned_alloc(alignment: usize, size: usize, state: &State) -> *mut ffi::c_void {
+    if !alignment.is_power_of_two() {
+        set_errno(libc::EINVAL);
+        return ptr::null_mut();
+    }
+    if !state.policy.uses_cxl(size) {
+        return (state.real.memalign)(alignment, size);
+    }
+    let Some(arena) = state.arena.as_ref() else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    match arena.allocate(size, alignment) {
+        Ok(pointer) => pointer.as_ptr(),
+        Err(ArenaError::InvalidAlignment) => {
+            set_errno(libc::EINVAL);
+            ptr::null_mut()
+        }
+        Err(_) => {
+            set_errno(libc::ENOMEM);
+            ptr::null_mut()
+        }
+    }
+}
+
+unsafe fn routed_valloc(size: usize, state: &State) -> *mut ffi::c_void {
+    routed_aligned_alloc(page_size(), size, state)
+}
+
+unsafe fn routed_free(pointer: *mut ffi::c_void, state: &State) {
+    if pointer.is_null() || is_early_pointer(pointer) {
+        return;
+    }
+    if state.arena_owns(pointer) {
+        if state
+            .arena
+            .as_ref()
+            .unwrap()
+            .deallocate(NonNull::new_unchecked(pointer))
+            .is_err()
+        {
+            set_errno(libc::EINVAL);
+        }
+    } else {
+        (state.real.free)(pointer);
+    }
+}
+
+unsafe fn routed_calloc(count: usize, size: usize, state: &State) -> *mut ffi::c_void {
+    let Some(total) = count.checked_mul(size) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    if !state.policy.uses_cxl(total) {
+        return (state.real.calloc)(count, size);
+    }
+    let pointer = routed_malloc(total, state);
+    if !pointer.is_null() {
+        scalar_fill(pointer.cast(), 0, total);
+    }
+    pointer
+}
+
+unsafe fn routed_realloc(
+    pointer: *mut ffi::c_void,
+    size: usize,
+    state: &State,
+) -> *mut ffi::c_void {
+    if pointer.is_null() {
+        return routed_malloc(size, state);
+    }
+    if size == 0 {
+        routed_free(pointer, state);
+        return ptr::null_mut();
+    }
+    if is_early_pointer(pointer) {
+        let new_pointer = routed_malloc(size, state);
+        if !new_pointer.is_null() {
+            let old_size = EARLY_SIZE.saturating_sub(pointer as usize - early_buf_base() as usize);
+            scalar_copy(new_pointer.cast(), pointer.cast(), size.min(old_size));
+        }
+        return new_pointer;
+    }
+
+    let old_size = if state.arena_owns(pointer) {
+        state
+            .arena
+            .as_ref()
+            .and_then(|arena| arena.allocation_size(NonNull::new_unchecked(pointer)))
+            .unwrap_or(0)
+    } else if !state.policy.uses_cxl(size) {
+        return (state.real.realloc)(pointer, size);
+    } else {
+        (state.real.malloc_usable_size)(pointer)
+    };
+
+    let new_pointer = routed_malloc(size, state);
+    if new_pointer.is_null() {
+        return ptr::null_mut();
+    }
+    scalar_copy(new_pointer.cast(), pointer.cast(), old_size.min(size));
+    routed_free(pointer, state);
+    new_pointer
+}
+
+unsafe fn scalar_fill(destination: *mut u8, value: u8, size: usize) {
+    for index in 0..size {
+        ptr::write_volatile(destination.add(index), value);
+    }
+}
+
+unsafe fn scalar_copy(destination: *mut u8, source: *const u8, size: usize) {
+    for index in 0..size {
+        let value = ptr::read_volatile(source.add(index));
+        ptr::write_volatile(destination.add(index), value);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interposed C allocation API
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn malloc(size: usize) -> *mut ffi::c_void {
-    if !INITIALIZED.load(Ordering::Acquire) {
-        return early_malloc(size);
+    #[cfg(test)]
+    {
+        return __libc_malloc(size);
     }
-    let slot = get_slot();
-    // Guard against re-entrancy: raw.allocator() uses Vec (calls malloc)
-    if IN_CXLALLOC[slot].swap(true, Ordering::Acquire) {
-        return early_malloc(size);
-    }
-    let id = unsafe { cxlalloc::thread::Id::new(slot as u16) };
-    let raw = RAW.get().unwrap();
-    let mut allocator = raw.allocator::<(), ()>(id);
-    let result = allocator.allocate_untyped(size);
-    IN_CXLALLOC[slot].store(false, Ordering::Release);
-    result
+    #[cfg(not(test))]
+    state()
+        .map(|state| routed_malloc(size, state))
+        .unwrap_or_else(|| early_malloc(size))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn free(pointer: *mut ffi::c_void) {
-    if pointer.is_null() || is_early_pointer(pointer) {
+    #[cfg(test)]
+    {
+        __libc_free(pointer);
         return;
     }
-    if !INITIALIZED.load(Ordering::Acquire) {
-        return; // pre-init mmap pointer, leaked
-    }
-    if let Some(p) = NonNull::new(pointer) {
-        let slot = get_slot();
-        if IN_CXLALLOC[slot].swap(true, Ordering::Acquire) {
-            return; // re-entrant free — leak (rare, from layout! Vec drop)
-        }
-        let id = unsafe { cxlalloc::thread::Id::new(slot as u16) };
-        let raw = RAW.get().unwrap();
-        let mut allocator = raw.allocator::<(), ()>(id);
-        allocator.free_untyped(p.cast());
-        IN_CXLALLOC[slot].store(false, Ordering::Release);
+    #[cfg(not(test))]
+    if let Some(state) = state() {
+        routed_free(pointer, state);
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn calloc(count: usize, size: usize) -> *mut ffi::c_void {
-    let total = count.saturating_mul(size);
-    let p = malloc(total);
-    if !p.is_null() {
-        ptr::write_bytes(p.cast::<u8>(), 0, total);
+    #[cfg(test)]
+    {
+        return __libc_calloc(count, size);
     }
-    p
+    #[cfg(not(test))]
+    state()
+        .map(|state| routed_calloc(count, size, state))
+        .unwrap_or_else(|| {
+            let total = count.checked_mul(size).unwrap_or(usize::MAX);
+            let pointer = early_malloc(total);
+            if !pointer.is_null() {
+                scalar_fill(pointer.cast(), 0, total);
+            }
+            pointer
+        })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn realloc(pointer: *mut ffi::c_void, size: usize) -> *mut ffi::c_void {
-    if pointer.is_null() {
-        return malloc(size);
+    #[cfg(test)]
+    {
+        return __libc_realloc(pointer, size);
     }
-    if size == 0 {
-        free(pointer);
-        return ptr::null_mut();
-    }
-    if is_early_pointer(pointer) {
-        let new = malloc(size);
-        if !new.is_null() {
-            let base = early_buf_base() as usize;
-            let old_offset = pointer as usize - base;
-            let max_old = EARLY_SIZE.saturating_sub(old_offset);
-            let copy_size = size.min(max_old);
-            // Use ptr::copy (not copy_nonoverlapping) because both old and
-            // new may come from the early bump buffer and overlap.
-            ptr::copy(pointer.cast::<u8>(), new.cast::<u8>(), copy_size);
-        }
-        return new;
-    }
-    if !INITIALIZED.load(Ordering::Acquire) {
-        return ptr::null_mut();
-    }
-    match NonNull::new(pointer) {
-        None => malloc(size),
-        Some(block) => {
-            let slot = get_slot();
-            if IN_CXLALLOC[slot].swap(true, Ordering::Acquire) {
-                return early_malloc(size); // re-entrant
-            }
-            let id = unsafe { cxlalloc::thread::Id::new(slot as u16) };
-            let raw = RAW.get().unwrap();
-            let mut allocator = raw.allocator::<(), ()>(id);
-            let result = allocator.realloc_untyped(block, size);
-            IN_CXLALLOC[slot].store(false, Ordering::Release);
-            result
-        }
-    }
+    #[cfg(not(test))]
+    state()
+        .map(|state| routed_realloc(pointer, size, state))
+        .unwrap_or(ptr::null_mut())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memalign(alignment: usize, size: usize) -> *mut ffi::c_void {
-    if let Ok(layout) = Layout::from_size_align(size, alignment) {
-        malloc(layout.pad_to_align().size())
-    } else {
-        ptr::null_mut()
+    #[cfg(test)]
+    {
+        return __libc_memalign(alignment, size);
     }
+    #[cfg(not(test))]
+    state()
+        .map(|state| routed_aligned_alloc(alignment, size, state))
+        .unwrap_or_else(|| early_malloc(size))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn posix_memalign(
-    memptr: *mut *mut ffi::c_void,
+    output: *mut *mut ffi::c_void,
     alignment: usize,
     size: usize,
 ) -> libc::c_int {
-    if alignment < core::mem::size_of::<*mut ffi::c_void>() || !alignment.is_power_of_two() {
+    if output.is_null()
+        || alignment < core::mem::size_of::<*mut ffi::c_void>()
+        || !alignment.is_power_of_two()
+    {
         return libc::EINVAL;
     }
-    let p = memalign(alignment, size);
-    if p.is_null() {
+    let pointer = memalign(alignment, size);
+    if pointer.is_null() {
         libc::ENOMEM
     } else {
-        *memptr = p;
+        *output = pointer;
         0
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut ffi::c_void {
+    if alignment == 0 || size % alignment != 0 {
+        set_errno(libc::EINVAL);
+        return ptr::null_mut();
+    }
     memalign(alignment, size)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn malloc_usable_size(_pointer: *mut ffi::c_void) -> usize {
-    0
+pub unsafe extern "C" fn valloc(size: usize) -> *mut ffi::c_void {
+    #[cfg(test)]
+    {
+        return __libc_memalign(page_size(), size);
+    }
+    #[cfg(not(test))]
+    state()
+        .map(|state| routed_valloc(size, state))
+        .unwrap_or_else(|| early_malloc(size))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pvalloc(size: usize) -> *mut ffi::c_void {
+    let page = page_size();
+    let Some(rounded) = size.checked_add(page - 1).map(|value| value & !(page - 1)) else {
+        set_errno(libc::ENOMEM);
+        return ptr::null_mut();
+    };
+    valloc(rounded)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn malloc_usable_size(pointer: *mut ffi::c_void) -> usize {
+    #[cfg(test)]
+    {
+        let _ = pointer;
+        return 0;
+    }
+    #[cfg(not(test))]
+    {
+        if pointer.is_null() || is_early_pointer(pointer) {
+            return 0;
+        }
+        let Some(state) = state() else {
+            return 0;
+        };
+        if state.arena_owns(pointer) {
+            state
+                .arena
+                .as_ref()
+                .and_then(|arena| arena.allocation_size(NonNull::new_unchecked(pointer)))
+                .unwrap_or(0)
+        } else {
+            (state.real.malloc_usable_size)(pointer)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Safe memset/memcpy/memmove — override glibc's SIMD versions
-//
-// glibc's memset/memcpy use AVX-512 non-temporal stores (vmovntdq) which
-// trigger SIGILL on QEMU-emulated CXL DAX memory. We override them with
-// `rep stosb`/`rep movsb` which use simple stores that work everywhere.
-//
-// `rep movsb` and `rep stosb` are fast on modern x86 CPUs with ERMS
-// (Enhanced REP MOVSB/STOSB) — comparable to hand-tuned SIMD loops for
-// most practical sizes.
+// MMIO-safe memory primitives
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub unsafe extern "C" fn memset(
-    dest: *mut ffi::c_void,
-    c: libc::c_int,
-    n: usize,
+    destination: *mut ffi::c_void,
+    value: libc::c_int,
+    size: usize,
 ) -> *mut ffi::c_void {
     core::arch::asm!(
         "rep stosb",
-        inout("rdi") dest => _,
-        inout("rcx") n => _,
-        in("al") c as u8,
+        inout("rdi") destination => _,
+        inout("rcx") size => _,
+        in("al") value as u8,
         options(nostack, preserves_flags),
     );
-    dest
+    destination
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memcpy(
-    dest: *mut ffi::c_void,
-    src: *const ffi::c_void,
-    n: usize,
+    destination: *mut ffi::c_void,
+    source: *const ffi::c_void,
+    size: usize,
 ) -> *mut ffi::c_void {
     core::arch::asm!(
         "rep movsb",
-        inout("rdi") dest => _,
-        inout("rsi") src => _,
-        inout("rcx") n => _,
+        inout("rdi") destination => _,
+        inout("rsi") source => _,
+        inout("rcx") size => _,
         options(nostack, preserves_flags),
     );
-    dest
+    destination
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn memmove(
-    dest: *mut ffi::c_void,
-    src: *const ffi::c_void,
-    n: usize,
+    destination: *mut ffi::c_void,
+    source: *const ffi::c_void,
+    size: usize,
 ) -> *mut ffi::c_void {
-    if (dest as usize) <= (src as usize) {
-        // Forward copy is safe — no overlap issue
-        memcpy(dest, src, n)
-    } else {
-        // Backward copy: use `std` direction flag with `rep movsb`
-        let dest_end = (dest as *mut u8).add(n - 1);
-        let src_end = (src as *const u8).add(n - 1);
-        core::arch::asm!(
-            "std",
-            "rep movsb",
-            "cld",
-            inout("rdi") dest_end => _,
-            inout("rsi") src_end => _,
-            inout("rcx") n => _,
-            options(nostack),
-        );
-        dest
+    if size == 0 || (destination as usize) <= (source as usize) {
+        return memcpy(destination, source, size);
     }
+
+    let destination_end = destination.cast::<u8>().add(size - 1);
+    let source_end = source.cast::<u8>().add(size - 1);
+    core::arch::asm!(
+        "std",
+        "rep movsb",
+        "cld",
+        inout("rdi") destination_end => _,
+        inout("rsi") source_end => _,
+        inout("rcx") size => _,
+        options(nostack),
+    );
+    destination
 }
 
 #[cfg(test)]
 mod tests {
-    use super::PlacementPolicy;
+    use super::{
+        errno, routed_aligned_alloc, routed_calloc, routed_free, routed_malloc, routed_realloc,
+        routed_valloc, BackendMode, PlacementPolicy, State,
+    };
 
     #[test]
     fn default_policy_keeps_small_allocations_in_dram() {
@@ -541,5 +585,94 @@ mod tests {
     fn default_policy_routes_128_mib_to_cxl() {
         let policy = PlacementPolicy::new(2 << 20);
         assert!(policy.uses_cxl(128 << 20));
+    }
+
+    #[test]
+    fn backend_mode_defaults_to_dax_mmap() {
+        assert_eq!(BackendMode::parse(None).unwrap(), BackendMode::DaxMmap);
+    }
+
+    #[test]
+    fn backend_mode_preserves_explicit_controls() {
+        assert_eq!(BackendMode::parse(Some("dax")).unwrap(), BackendMode::Dax);
+        assert_eq!(
+            BackendMode::parse(Some("dax-mmap")).unwrap(),
+            BackendMode::DaxMmap,
+        );
+        assert_eq!(BackendMode::parse(Some("mmap")).unwrap(), BackendMode::Mmap);
+        assert!(BackendMode::parse(Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn routing_small_malloc_uses_libc_and_large_malloc_uses_arena() {
+        let state = State::anonymous_for_test(256 << 20, 2 << 20).unwrap();
+        let small = unsafe { routed_malloc(4096, &state) };
+        let large = unsafe { routed_malloc(128 << 20, &state) };
+        assert!(!small.is_null());
+        assert!(!large.is_null());
+        assert!(!state.arena_owns(small));
+        assert!(state.arena_owns(large));
+        unsafe {
+            routed_free(small, &state);
+            routed_free(large, &state);
+        }
+    }
+
+    #[test]
+    fn routing_valloc_is_page_aligned_and_arena_owned() {
+        let state = State::anonymous_for_test(256 << 20, 2 << 20).unwrap();
+        let pointer = unsafe { routed_valloc(128 << 20, &state) };
+        assert!(!pointer.is_null());
+        assert_eq!((pointer as usize) % 4096, 0);
+        assert!(state.arena_owns(pointer));
+        unsafe { routed_free(pointer, &state) };
+    }
+
+    #[test]
+    fn routing_arena_oom_returns_null_without_libc_fallback() {
+        let state = State::anonymous_for_test(4 << 20, 2 << 20).unwrap();
+        let pointer = unsafe { routed_malloc(8 << 20, &state) };
+        assert!(pointer.is_null());
+        assert_eq!(errno(), libc::ENOMEM);
+    }
+
+    #[test]
+    fn routing_large_calloc_zeroes_the_arena_allocation() {
+        let state = State::anonymous_for_test(8 << 20, 2 << 20).unwrap();
+        let pointer = unsafe { routed_calloc(1, 2 << 20, &state) };
+        assert!(!pointer.is_null());
+        assert_eq!(unsafe { pointer.cast::<u8>().read_volatile() }, 0);
+        assert_eq!(
+            unsafe { pointer.cast::<u8>().add((2 << 20) - 1).read_volatile() },
+            0,
+        );
+        unsafe { routed_free(pointer, &state) };
+    }
+
+    #[test]
+    fn routing_realloc_preserves_arena_bytes_and_ownership() {
+        let state = State::anonymous_for_test(16 << 20, 2 << 20).unwrap();
+        let pointer = unsafe { routed_malloc(2 << 20, &state) };
+        unsafe {
+            pointer.cast::<u8>().write_volatile(0x5a);
+            pointer.cast::<u8>().add((2 << 20) - 1).write_volatile(0xa5);
+        }
+        let grown = unsafe { routed_realloc(pointer, 4 << 20, &state) };
+        assert!(!grown.is_null());
+        assert!(state.arena_owns(grown));
+        assert_eq!(unsafe { grown.cast::<u8>().read_volatile() }, 0x5a);
+        assert_eq!(
+            unsafe { grown.cast::<u8>().add((2 << 20) - 1).read_volatile() },
+            0xa5,
+        );
+        unsafe { routed_free(grown, &state) };
+    }
+
+    #[test]
+    fn routing_aligned_allocation_rejects_invalid_alignment() {
+        let state = State::anonymous_for_test(8 << 20, 2 << 20).unwrap();
+        let pointer = unsafe { routed_aligned_alloc(24, 2 << 20, &state) };
+        assert!(pointer.is_null());
+        assert_eq!(errno(), libc::EINVAL);
     }
 }
