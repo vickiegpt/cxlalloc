@@ -29,6 +29,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod dax_arena;
 mod real;
 
 use core::ffi;
