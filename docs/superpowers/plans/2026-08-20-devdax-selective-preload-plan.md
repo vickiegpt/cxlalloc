@@ -15,6 +15,8 @@
 - `/dev/dax0.0` remains in `devdax` mode.
 - The acceptance workload is capped at 128 MiB because the live device is 250 MiB.
 - A CXL-selected allocation never silently spills into DRAM.
+- `dax-mmap` remains the default and acceptance mode: placement is selective
+  between allocations, never mixed within the selected lmbench buffer.
 - Allocator metadata, locks, extent records, libc objects, and small allocations remain in DRAM.
 - Do not add a `SIGILL` emulator or modify the lmbench executable.
 - Use scalar MMIO-safe initialization and copies for CXL-owned memory.
@@ -380,8 +382,8 @@ Also add backend-mode parsing tests:
 
 ```rust
 #[test]
-fn backend_mode_defaults_to_pure_dax() {
-    assert_eq!(BackendMode::parse(None).unwrap(), BackendMode::Dax);
+fn backend_mode_defaults_to_dax_mmap() {
+    assert_eq!(BackendMode::parse(None).unwrap(), BackendMode::DaxMmap);
 }
 
 #[test]
@@ -389,7 +391,7 @@ fn backend_mode_preserves_explicit_controls() {
     assert_eq!(BackendMode::parse(Some("mmap")).unwrap(), BackendMode::Mmap);
     assert_eq!(
         BackendMode::parse(Some("dax-mmap")).unwrap(),
-        BackendMode::LegacyDaxMmap,
+        BackendMode::DaxMmap,
     );
     assert!(BackendMode::parse(Some("unknown")).is_err());
 }
@@ -418,12 +420,12 @@ unsafe fn routed_aligned_alloc(alignment: usize, size: usize, state: &State) -> 
 ```
 
 `State` contains `RealAlloc`, `PlacementPolicy`, and a `BackendState` selected
-by `CXLALLOC_BACKEND`. `dax` is the default and owns a `DaxArena`; `mmap` owns
-an anonymous arena for the DRAM control; explicit `dax-mmap` retains the
-existing `RAW`-based legacy behavior but is excluded from CXL-only acceptance.
-Unknown modes are initialization errors, not implicit DRAM fallback. The
-constructor publishes `State` through `OnceLock` only after its components
-initialize successfully.
+by `CXLALLOC_BACKEND`. `dax-mmap` is the default: selected large allocations use
+a `DaxArena`, while small allocations go to real libc. Explicit `dax` uses the
+same arena for selected allocations without changing the no-spill rule. `mmap`
+owns an anonymous arena for the DRAM control. Unknown modes are initialization
+errors, not implicit DRAM fallback. The constructor publishes `State` through
+`OnceLock` only after its components initialize successfully.
 
 - [ ] **Step 4: Implement standards-correct alignment APIs and `valloc`**
 
