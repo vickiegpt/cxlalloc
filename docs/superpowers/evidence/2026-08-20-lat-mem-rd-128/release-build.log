@@ -1,0 +1,21 @@
+warning: function `errno` is never used
+   --> cxlalloc-preload/src/lib.rs:210:4
+    |
+210 | fn errno() -> libc::c_int {
+    |    ^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+
+warning: fields `valloc` and `pvalloc` are never read
+  --> cxlalloc-preload/src/real.rs:11:9
+   |
+5  | pub(crate) struct RealAlloc {
+   |                   --------- fields in this struct
+...
+11 |     pub valloc: unsafe extern "C" fn(usize) -> *mut c_void,
+   |         ^^^^^^
+12 |     pub pvalloc: unsafe extern "C" fn(usize) -> *mut c_void,
+   |         ^^^^^^^
+
+warning: `cxlalloc-preload` (lib) generated 2 warnings
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.04s

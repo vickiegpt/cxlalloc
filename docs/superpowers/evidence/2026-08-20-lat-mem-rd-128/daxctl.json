@@ -1,0 +1,9 @@
+[
+  {
+    "chardev":"dax0.0",
+    "size":262144000,
+    "target_node":1,
+    "align":2097152,
+    "mode":"devdax"
+  }
+]

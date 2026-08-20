@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running unittests src/lib.rs (target/debug/deps/cxlalloc-46f709093162de3e)
+
+running 5 tests
+test size::test::large_consistent ... ok
+test size::test::small_consistent ... ok
+test bitset::fill_len ... ok
+test bitset::peek_unset_len ... ok
+test bitset::set_peek_len ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

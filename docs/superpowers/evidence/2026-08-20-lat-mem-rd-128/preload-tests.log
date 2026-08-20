@@ -1,0 +1,119 @@
+warning: static `STATE` is never used
+  --> cxlalloc-preload/src/lib.rs:35:8
+   |
+35 | static STATE: OnceLock<State> = OnceLock::new();
+   |        ^^^^^
+   |
+   = note: `#[warn(dead_code)]` on by default
+
+warning: static `INITIALIZED` is never used
+  --> cxlalloc-preload/src/lib.rs:36:8
+   |
+36 | static INITIALIZED: AtomicBool = AtomicBool::new(false);
+   |        ^^^^^^^^^^^
+
+warning: associated items `DEFAULT_MIN_SIZE` and `from_env` are never used
+  --> cxlalloc-preload/src/lib.rs:43:11
+   |
+42 | impl PlacementPolicy {
+   | -------------------- associated items in this implementation
+43 |     const DEFAULT_MIN_SIZE: usize = 2 << 20;
+   |           ^^^^^^^^^^^^^^^^
+...
+49 |     fn from_env() -> Self {
+   |        ^^^^^^^^
+
+warning: associated function `from_env` is never used
+  --> cxlalloc-preload/src/lib.rs:87:8
+   |
+86 | impl State {
+   | ---------- associated function in this implementation
+87 |     fn from_env() -> Result<Self, &'static str> {
+   |        ^^^^^^^^
+
+warning: static `EARLY_OFFSET` is never used
+   --> cxlalloc-preload/src/lib.rs:145:8
+    |
+145 | static EARLY_OFFSET: AtomicUsize = AtomicUsize::new(0);
+    |        ^^^^^^^^^^^^
+
+warning: function `early_malloc` is never used
+   --> cxlalloc-preload/src/lib.rs:151:4
+    |
+151 | fn early_malloc(size: usize) -> *mut ffi::c_void {
+    |    ^^^^^^^^^^^^
+
+warning: function `init` is never used
+   --> cxlalloc-preload/src/lib.rs:183:22
+    |
+183 | unsafe extern "C" fn init() {
+    |                      ^^^^
+
+warning: function `write_diagnostic` is never used
+   --> cxlalloc-preload/src/lib.rs:193:4
+    |
+193 | fn write_diagnostic(message: &[u8]) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `state` is never used
+   --> cxlalloc-preload/src/lib.rs:199:4
+    |
+199 | fn state() -> Option<&'static State> {
+    |    ^^^^^
+
+warning: associated function `open` is never used
+  --> cxlalloc-preload/src/dax_arena.rs:61:19
+   |
+60 | impl DaxArena {
+   | ------------- associated function in this implementation
+61 |     pub(crate) fn open(path: &CStr) -> Result<Self, ArenaError> {
+   |                   ^^^^
+
+warning: function `read_sysfs_usize` is never used
+   --> cxlalloc-preload/src/dax_arena.rs:407:4
+    |
+407 | fn read_sysfs_usize(path: &str) -> Result<usize, ArenaError> {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `page_size` is never used
+   --> cxlalloc-preload/src/dax_arena.rs:421:4
+    |
+421 | fn page_size() -> usize {
+    |    ^^^^^^^^^
+
+warning: fields `valloc` and `pvalloc` are never read
+  --> cxlalloc-preload/src/real.rs:11:9
+   |
+5  | pub(crate) struct RealAlloc {
+   |                   --------- fields in this struct
+...
+11 |     pub valloc: unsafe extern "C" fn(usize) -> *mut c_void,
+   |         ^^^^^^
+12 |     pub pvalloc: unsafe extern "C" fn(usize) -> *mut c_void,
+   |         ^^^^^^^
+
+warning: `cxlalloc-preload` (lib test) generated 13 warnings
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/cxlalloc_preload-f78dbffaf40d268d)
+
+running 17 tests
+test dax_arena::tests::capacity_exhaustion_does_not_fall_back ... ok
+test dax_arena::tests::exclusive_lock_rejects_a_second_open_description ... ok
+test dax_arena::tests::allocations_are_aligned_nonoverlapping_and_reused_after_free ... ok
+test dax_arena::tests::parses_device_name_size_and_alignment ... ok
+test real::tests::resolves_malloc_and_free_from_next_object ... ok
+test tests::backend_mode_defaults_to_dax_mmap ... ok
+test dax_arena::tests::pointer_below_arena_is_not_owned ... ok
+test tests::backend_mode_preserves_explicit_controls ... ok
+test tests::default_policy_routes_128_mib_to_cxl ... ok
+test tests::default_policy_keeps_small_allocations_in_dram ... ok
+test tests::routing_aligned_allocation_rejects_invalid_alignment ... ok
+test tests::routing_arena_oom_returns_null_without_libc_fallback ... ok
+test dax_arena::tests::allocation_state_is_shared_across_fork ... ok
+test tests::routing_small_malloc_uses_libc_and_large_malloc_uses_arena ... ok
+test tests::routing_valloc_is_page_aligned_and_arena_owned ... ok
+test tests::routing_realloc_preserves_arena_bytes_and_ownership ... ok
+test tests::routing_large_calloc_zeroes_the_arena_allocation ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
