@@ -1,0 +1,8 @@
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8): No such file or directory
+placement mismatch: large_is_dax=0 small_is_dax=0
+large=0x775d92035000 map=775d92034000-775d9a039000 rw-p 00000000 00:00 0 
+small=0x5eb4d80662a0 map=5eb4d8066000-5eb4d8087000 rw-p 00000000 00:00 0                          [heap]
+negative_control=PASS
+large=0x7269e0e00000 map=7269e0e00000-7269f0800000 rw-s 00000000 00:06 408                        /dev/dax0.0
+small=0x589cf2b7a2a0 map=589cf2b7a000-589cf2b9b000 rw-p 00000000 00:00 0                          [heap]
+placement=PASS

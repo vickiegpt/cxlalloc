@@ -63,9 +63,11 @@ default to 2 MiB, matching the live device alignment. `valloc` and `pvalloc`
 will be interposed and follow the same size policy. Thus lmbench's 128 MiB
 `valloc` request takes the CXL path without requiring an application change.
 
-The default backend for CXL-selected allocations will be the pure `dax` path.
-`dax-mmap` remains an explicit opt-in mode and is not permitted in the CXL-only
-acceptance run.
+The default and acceptance backend remains `dax-mmap`. In selective preload
+mode, this name describes allocation-level placement: large CXL-selected
+allocations use the devdax arena, while small incidental allocations use
+libc-backed DRAM. A selected allocation is never striped across or spilled into
+DRAM, so lmbench's complete measured buffer remains CXL-only.
 
 ### devdax arena
 
@@ -144,4 +146,3 @@ Implementation follows test-driven development.
 
 Passing build or unit tests is not sufficient; completion requires the live
 devdax mapping and full lmbench run evidence.
-
